@@ -395,13 +395,21 @@ def _claude_intent(goal):
         system=LLM_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_msg}],
     )
-    # Pull the text block (don't assume content[0]); strip stray fences.
+    # Pull the text block (don't assume content[0]).
     text = next((b.text for b in resp.content if b.type == "text"), "").strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        text = text[text.find("{"):]  # jump to the first '{'
-    data = json.loads(text)
-    boost = max(0, min(int(data.get("intent_boost", 0)), 20))  # clamp 0..20
+    # Robust parse: the model is told to return ONLY JSON, but occasionally wraps
+    # it in ```fences``` or appends a stray sentence — which makes json.loads() on
+    # the whole string raise "Extra data". Locate the first '{' and decode only the
+    # first JSON object, ignoring anything before or after it.
+    start = text.find("{")
+    if start == -1:
+        raise ValueError(f"model returned no JSON object: {text[:120]!r}")
+    data, _ = json.JSONDecoder().raw_decode(text[start:])
+    try:                                          # tolerate int, float, or "15"
+        boost = int(float(data.get("intent_boost", 0)))
+    except (TypeError, ValueError):
+        boost = 0
+    boost = max(0, min(boost, 20))                # clamp 0..20
     why = str(data.get("why_now", "")).strip()
     return boost, why
 
