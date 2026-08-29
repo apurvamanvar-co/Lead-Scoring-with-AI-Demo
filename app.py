@@ -458,7 +458,11 @@ st.set_page_config(page_title="RevOps Lead Prioritization",
 # the Anthropic SDK pick it up. Locally, ANTHROPIC_API_KEY is just an env var.
 try:
     if not os.environ.get("ANTHROPIC_API_KEY") and "ANTHROPIC_API_KEY" in st.secrets:
-        os.environ["ANTHROPIC_API_KEY"] = st.secrets["ANTHROPIC_API_KEY"]
+        # .strip() is deliberate: a trailing space/newline pasted into the Secrets
+        # box leaves the value non-empty (so the "key not set" warning clears) but
+        # invalid on the wire (the API rejects a key with whitespace) -> every call
+        # 401s and silently falls back. Stripping kills that whole failure class.
+        os.environ["ANTHROPIC_API_KEY"] = str(st.secrets["ANTHROPIC_API_KEY"]).strip()
 except Exception:
     pass
 
@@ -541,6 +545,7 @@ def get_full():
     goal_cache = st.session_state.setdefault("goal_cache", {})  # goal -> (boost, why) | None=failed
     st.session_state["enrich_builds"] = st.session_state.get("enrich_builds", 0) + 1
     calls = reused = bplus = 0
+    first_error = None            # surfaced on stage 3 so failures aren't invisible
 
     full = []
     with st.spinner("Claude is reading the form goals…"):
@@ -564,7 +569,10 @@ def get_full():
                         why = why or ("Form goal signals concrete intent." if boost > 0
                                       else "Form goal shows little urgency.")
                         goal_cache[goal] = (boost, why)
-                    except Exception:                         # 429/network/parse -> fallback, NO retry
+                    except Exception as e:                    # 429/network/auth/parse -> fallback, NO retry
+                        if first_error is None:               # keep the FIRST failure to show the user
+                            first_error = f"{type(e).__name__}: {e}"
+                            print(f"[claude_intent] call failed -> {first_error}")  # -> Cloud logs
                         boost, why = 0, _rules_based_why_now(lead, base)
                         goal_cache[goal] = None               # remember the failure; don't retry
                     calls += 1
@@ -573,7 +581,8 @@ def get_full():
                          "total_score": total, "tier": tier_for_score(total)})
 
     st.session_state[list_key] = full
-    st.session_state[f"stats_v{version}"] = {"calls": calls, "reused": reused, "bplus": bplus}
+    st.session_state[f"stats_v{version}"] = {"calls": calls, "reused": reused,
+                                             "bplus": bplus, "error": first_error}
     return full
 
 
@@ -780,7 +789,8 @@ def render_claude():
     )
     eligible = [r for r in full if r["base_score"] >= thr]
     version = st.session_state.get("data_version", 0)
-    stats = st.session_state.get(f"stats_v{version}", {"calls": 0, "reused": 0})
+    stats = st.session_state.get(f"stats_v{version}",
+                                 {"calls": 0, "reused": 0, "error": None})
     builds = st.session_state.get("enrich_builds", 0)
     c1, c2, c3 = st.columns(3)
     c1.metric("B+ leads (Claude-eligible)", len(eligible))
@@ -791,6 +801,14 @@ def render_claude():
         f"Reruns, Back/Next, and filter changes add **zero** calls. "
         f"Enrichment builds this session so far: **{builds}**."
     )
+    if stats.get("error"):
+        st.error(
+            f"⚠️ **Claude calls are failing — every lead fell back to the rules.**\n\n"
+            f"First error: `{stats['error']}`\n\n"
+            "Usual causes: the key in **Secrets** is wrong/rejected (auth error), or an "
+            "SDK/network issue. The score, tiers, and routing are unaffected — only the "
+            "AI *why now* is degraded."
+        )
     st.markdown("**What Claude did with that field:**")
     rows = [{
         "Name": r["lead"]["name"],
